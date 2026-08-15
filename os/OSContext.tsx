@@ -6,6 +6,7 @@ import { flushAll, flushKey } from './debouncedPersist';
 import { getTimeConfig, now, realNow, formatTime, formatDate, getDayOfWeek } from './TimeService';
 import { getLocationConfig, getSimulatedCoords } from './LocationService';
 import { isValidAppId, dataLoaderByAppId } from './data/appRegistry';
+import { selectAppDataLoaders } from './data/selectAppDataLoaders';
 import { clearFileSystemDB, initFileSystem } from './FileSystemService';
 import * as MediaService from './MediaService';
 import { KeyboardService } from './keyboard/KeyboardService';
@@ -686,19 +687,13 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
       /** 定向预加载指定 app 的 state.ts — no-op: eager loaded */
       preloadAppStores: async (_appIds: string[]) => { /* no-op: eager loaded */ },
       waitForData: async (appIds?: string[]) => {
-        const all = !appIds || appIds.length === 0;
-        const has = (id: string) => all || appIds!.includes(id);
-
         const loadApp = async (importFn: () => Promise<any>) => {
           const mod = await importFn();
           await runAppDataLoaderModule(mod);
         };
 
-        const entries: { appId: string; importFn: () => Promise<any> }[] = [];
-        for (const [appId, importFn] of dataLoaderByAppId) {
-          if (!has(appId)) continue;
-          entries.push({ appId, importFn });
-        }
+        const entries = selectAppDataLoaders(dataLoaderByAppId, appIds)
+          .map(([appId, importFn]) => ({ appId, importFn }));
 
         const results = await Promise.allSettled(
           entries.map(e => loadApp(e.importFn)),
