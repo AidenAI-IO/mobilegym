@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import shlex
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -52,10 +54,10 @@ async def test_mobile_gym_reset_clears_agent_answer() -> None:
     env = MobileGymEnv(url="http://localhost", verbose=False)
     env._agent_answer = "old"
 
-    async def fake_reset_sim() -> None:
+    async def fake_reset_sim(*, timeout_ms=None) -> None:
         return None
 
-    async def fake_wait_ready(*, app_ids=None) -> None:
+    async def fake_wait_ready(*, timeout_ms=None, app_ids=None) -> None:
         return None
 
     env._reset_sim = fake_reset_sim  # type: ignore[method-assign]
@@ -64,6 +66,114 @@ async def test_mobile_gym_reset_clears_agent_answer() -> None:
     await env.reset(app_ids=[])
 
     assert env.agent_answer is None
+
+
+@pytest.mark.asyncio
+async def test_mobile_gym_wait_ready_uses_one_total_deadline() -> None:
+    env = MobileGymEnv(url="http://localhost", verbose=False)
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.timeouts = []
+            self.evaluate_expression = ""
+
+        async def wait_for_function(self, _expression, *, timeout):
+            self.timeouts.append(timeout)
+            if len(self.timeouts) == 1:
+                await asyncio.sleep(0.02)
+
+        async def evaluate(self, expression, _app_ids):
+            self.evaluate_expression = expression
+            return {"ok": True, "failed": []}
+
+    page = FakePage()
+    env._page = page  # type: ignore[assignment]
+
+    await env._wait_ready(timeout_ms=30, app_ids=[])
+
+    assert page.timeouts[0] <= 30
+    assert page.timeouts[1] < 20
+    assert page.timeouts[2] <= page.timeouts[1]
+    assert "ids === null ? undefined : ids" in page.evaluate_expression
+
+
+@pytest.mark.asyncio
+async def test_mobile_gym_wait_ready_times_out_wait_for_data_with_phase() -> None:
+    env = MobileGymEnv(url="http://localhost", verbose=False)
+
+    class FakePage:
+        async def wait_for_function(self, _expression, *, timeout):
+            return None
+
+        async def evaluate(self, _expression, _app_ids):
+            await asyncio.sleep(10)
+
+    env._page = FakePage()  # type: ignore[assignment]
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError, match="phase=waitForData"):
+        await env._wait_ready(timeout_ms=20, app_ids=[])
+
+    assert time.monotonic() - started < 0.2
+
+
+@pytest.mark.asyncio
+async def test_mobile_gym_reset_state_uses_reset_budget_and_reports_phase() -> None:
+    env = MobileGymEnv(url="http://localhost", verbose=False)
+
+    class FakePage:
+        async def evaluate(self, _expression):
+            await asyncio.sleep(10)
+
+        async def goto(self, _url, *, wait_until, timeout):
+            raise AssertionError("goto should not run after resetState timeout")
+
+    env._page = FakePage()  # type: ignore[assignment]
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError, match="phase=resetState"):
+        await env._reset_sim(timeout_ms=20)
+
+    assert time.monotonic() - started < 0.2
+
+
+@pytest.mark.asyncio
+async def test_mobile_gym_reset_retry_uses_goto_without_reset_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = MobileGymEnv(url="http://localhost", verbose=False)
+    reset_sim_calls = 0
+    ready_calls = 0
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.goto_calls = 0
+
+        async def goto(self, _url, *, wait_until, timeout):
+            self.goto_calls += 1
+
+    page = FakePage()
+    env._page = page  # type: ignore[assignment]
+
+    async def fake_reset_sim(*, timeout_ms):
+        nonlocal reset_sim_calls
+        reset_sim_calls += 1
+        raise RuntimeError("initial navigation failed")
+
+    async def fake_wait_ready(*, timeout_ms, app_ids):
+        nonlocal ready_calls
+        ready_calls += 1
+
+    async def fake_sleep(_seconds):
+        return None
+
+    env._reset_sim = fake_reset_sim  # type: ignore[method-assign]
+    env._wait_ready = fake_wait_ready  # type: ignore[method-assign]
+    monkeypatch.setattr("bench_env.env.mobile_gym.asyncio.sleep", fake_sleep)
+
+    await env.reset(app_ids=[], timeout_ms=1000)
+
+    assert reset_sim_calls == 1
+    assert page.goto_calls == 1
+    assert ready_calls == 1
 
 
 @pytest.mark.asyncio

@@ -10,16 +10,30 @@ import gzip
 import json as json_mod
 import logging
 import random
+import time
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 from bench_env.logger import get_logger
 from bench_env.env.base import Action, ActionType, BaseMobileEnv, Observation, StepResult
 from bench_env.task import TaskRegistry, JudgeInput, JudgeResult, BaseTask
 
 logger = get_logger(__name__)
+
+DEFAULT_RESET_TIMEOUT_MS = 40000
+
+
+def _remaining_timeout_ms(deadline: float) -> int:
+    return max(1, int((deadline - time.monotonic()) * 1000))
 
 
 def _env_message(env: "MobileGymEnv", message: str) -> str:
@@ -745,12 +759,16 @@ class MobileGymEnv(BaseMobileEnv):
 
     # ==================== Environment Interface ====================
 
-    async def reset(self, app_ids: list[str] | None = None) -> None:
+    async def reset(
+        self,
+        app_ids: list[str] | None = None,
+        timeout_ms: int = DEFAULT_RESET_TIMEOUT_MS,
+    ) -> None:
         """Reset environment and start new episode.
 
         Retry strategy:
-          attempt 0: resetState() + goto(url) — normal path
-          attempt 1: goto(url) only — in case resetState() itself caused issues
+          attempt 0: resetState() + goto(url) for the normal path
+          attempts 1-2: goto(url) only, avoiding repeated state cleanup
 
         goto(url) is used instead of reload() so we always return to the
         correct simulator URL regardless of where the page drifted during
@@ -761,46 +779,61 @@ class MobileGymEnv(BaseMobileEnv):
         assets when all workers restart simultaneously.
 
         Args:
-            app_ids: 需要预加载重型数据的 App ID 列表（如 ['redbook']）。
-                     传 None 则加载全部（旧行为）；传 [] 则跳过预加载。
+            app_ids: App IDs whose heavy data loaders should be preloaded.
+                     None loads every registered loader; [] skips eager loading.
+            timeout_ms: Total budget shared by reset, retries, and readiness.
         """
         self._step_count = 0
         self._done = False
         self._agent_message = None
         self._agent_answer = None
+        deadline = time.monotonic() + max(1, timeout_ms) / 1000
 
         # First reset after start() — page is already clean, skip reload
         if self._fresh:
             self._fresh = False
             _log_env_info(self, "reset: skipped (fresh page from start)")
             with self.stopwatch.phase("wait_ready"):
-                await self._wait_ready(app_ids=app_ids)
+                await self._wait_ready(
+                    timeout_ms=_remaining_timeout_ms(deadline),
+                    app_ids=app_ids,
+                )
             return
 
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
                 with self.stopwatch.phase("reset_sim"):
-                    await self._reset_sim()
+                    if attempt == 0:
+                        await self._reset_sim(timeout_ms=_remaining_timeout_ms(deadline))
+                    else:
+                        await self.page.goto(
+                            self.url,
+                            wait_until="load",
+                            timeout=_remaining_timeout_ms(deadline),
+                        )
                 with self.stopwatch.phase("wait_ready"):
-                    await self._wait_ready(app_ids=app_ids)
+                    await self._wait_ready(
+                        timeout_ms=_remaining_timeout_ms(deadline),
+                        app_ids=app_ids,
+                    )
                 return  # success
             except Exception as e:
                 logger.warning(
                     f"{self._log_prefix}[page#{self._page_seq}] reset() attempt {attempt + 1}/{max_retries + 1} failed: "
                     f"{type(e).__name__}: {e}"
                 )
+                timed_out = isinstance(e, (TimeoutError, asyncio.TimeoutError, PlaywrightTimeoutError))
+                if timed_out or time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"reset timed out after {timeout_ms}ms on attempt {attempt + 1}/{max_retries + 1}: {e}"
+                    ) from e
                 if attempt >= max_retries:
                     raise RuntimeError(
                         f"reset failed after {max_retries + 1} attempts (page#{self._page_seq}): {e}"
                     ) from e
-                await asyncio.sleep(0.5 + attempt * 1.0)
-                # Retry: goto only (skip resetState in case it caused the failure)
+                await asyncio.sleep(min(0.5 + attempt * 1.0, max(0.0, deadline - time.monotonic())))
                 logger.info(f"{self._log_prefix}[page#{self._page_seq}] reset retry: goto only (skipping resetState)")
-                try:
-                    await self.page.goto(self.url, wait_until="load", timeout=60000)
-                except Exception as re:
-                    logger.warning(f"{self._log_prefix}[page#{self._page_seq}] goto during reset retry failed: {type(re).__name__}: {re}")
 
     async def step(self, action: Action) -> StepResult:
         """Execute action and return result."""
@@ -1241,20 +1274,30 @@ class MobileGymEnv(BaseMobileEnv):
 
     async def _reset_sim(self, timeout_ms: int = 60000) -> None:
         """Clear state and reload page. Fail-closed on reload failure."""
+        deadline = time.monotonic() + max(1, timeout_ms) / 1000
         try:
             # Clear state WITHOUT triggering JS location.reload().
             # resetState() = new API (no reload); fallback = manual cleanup.
             # NEVER call __SIM__.reset() here — it contains location.reload()
             # which races with the Python page.reload() below.
-            await self.page.evaluate("""async () => {
-                if (window.__SIM__?.resetState) {
-                    await window.__SIM__.resetState();
-                    return;
-                }
-                // Manual fallback (no reload)
-                try { localStorage.clear(); } catch {}
-                try { sessionStorage.clear(); } catch {}
-            }""")
+            reset_state_timeout_ms = _remaining_timeout_ms(deadline)
+            await asyncio.wait_for(
+                self.page.evaluate("""async () => {
+                    if (window.__SIM__?.resetState) {
+                        await window.__SIM__.resetState();
+                        return;
+                    }
+                    // Manual fallback (no reload)
+                    try { localStorage.clear(); } catch {}
+                    try { sessionStorage.clear(); } catch {}
+                }"""),
+                timeout=reset_state_timeout_ms / 1000,
+            )
+        except (TimeoutError, asyncio.TimeoutError, PlaywrightTimeoutError) as e:
+            raise TimeoutError(
+                f"{self._log_prefix}[page#{self._page_seq}] _reset_sim() "
+                f"phase=resetState timeout: {type(e).__name__}: {e}"
+            ) from e
         except Exception as e:
             # resetState failure is non-fatal — the reload below will clear state anyway
             logger.warning(
@@ -1269,73 +1312,114 @@ class MobileGymEnv(BaseMobileEnv):
         # would otherwise cause a Chromium cold-context 502 race on static assets.
         # Navigation failure IS fatal — page is in an unknown state.
         try:
-            await self.page.goto(self.url, wait_until="load", timeout=timeout_ms)
+            await self.page.goto(
+                self.url,
+                wait_until="load",
+                timeout=_remaining_timeout_ms(deadline),
+            )
+        except (TimeoutError, asyncio.TimeoutError, PlaywrightTimeoutError) as e:
+            raise TimeoutError(
+                f"{self._log_prefix}[page#{self._page_seq}] _reset_sim() "
+                f"phase=goto timeout: {type(e).__name__}: {e}"
+            ) from e
         except Exception as e:
             raise RuntimeError(
                 f"{self._log_prefix}[page#{self._page_seq}] _reset_sim() "
                 f"phase=goto failed: {type(e).__name__}: {e}"
             ) from e
 
-    async def _wait_ready(self, timeout_ms: int = 60000, app_ids: list[str] | None = None) -> None:
-        """Wait for page to be fully initialized. Fail-closed: exceptions propagate."""
+    async def _wait_ready(self, timeout_ms: int = DEFAULT_RESET_TIMEOUT_MS, app_ids: list[str] | None = None) -> None:
+        """Wait for page readiness under one shared deadline."""
         sw = self.stopwatch
         p = f"{self._log_prefix}[page#{self._page_seq}]"
-        # 1. Wait for core APIs
-        try:
-            with sw.phase("SIM"):
-                await self.page.wait_for_function(
-                    "() => Boolean(window.__SIM__ && typeof window.__SIM__.getState === 'function')",
-                    timeout=timeout_ms,
-                )
-        except Exception as e:
-            raise RuntimeError(f"{p} _wait_ready phase=__SIM__ timeout: {type(e).__name__}: {e}") from e
-        try:
-            with sw.phase("SIM_FS"):
-                await self.page.wait_for_function(
-                    "() => Boolean(window.__SIM_FS__)",
-                    timeout=timeout_ms,
-                )
-        except Exception as e:
-            raise RuntimeError(f"{p} _wait_ready phase=__SIM_FS__ timeout: {type(e).__name__}: {e}") from e
-        # 等待 __OS__ 初始化完成（open_app 依赖此对象）
-        try:
-            with sw.phase("OS"):
-                await self.page.wait_for_function(
-                    "() => Boolean(window.__OS__?.openApp)",
-                    timeout=timeout_ms,
-                )
-        except Exception as e:
-            raise RuntimeError(f"{p} _wait_ready phase=__OS__ timeout: {type(e).__name__}: {e}") from e
-        # 3. 预加载当前任务涉及的 App 的重型数据 (allSettled with per-app error)
-        with sw.phase("waitForData"):
-            wait_result = await self.page.evaluate(
-            """async (ids) => {
-                if (!window.__SIM__?.waitForData) return {ok: true, failed: []};
-                // Monkey-patch fetch to capture response debug info on non-ok responses
-                const origFetch = window.fetch;
-                window.fetch = async function(...args) {
-                    const resp = await origFetch.apply(this, args);
-                    if (!resp.ok) {
-                        const body = await resp.clone().text().catch(() => '(unreadable)');
-                        console.error(
-                            `[waitForData] fetch FAILED: url=${resp.url} status=${resp.status} ` +
-                            `statusText=${resp.statusText} type=${resp.type} redirected=${resp.redirected} ` +
-                            `bodyLen=${body.length} body=${body.substring(0, 200)}`
-                        );
-                    }
-                    return resp;
-                };
-                try {
-                    await window.__SIM__.waitForData(ids || undefined);
-                    return {ok: true, failed: []};
-                } catch (e) {
-                    return {ok: false, error: String(e)};
-                } finally {
-                    window.fetch = origFetch;
-                }
-            }""",
-            app_ids,
+        deadline = time.monotonic() + max(1, timeout_ms) / 1000
+
+        async def run_phase(name: str, operation):
+            phase_timeout_ms = _remaining_timeout_ms(deadline)
+            started = time.monotonic()
+            _log_env_info(
+                self,
+                f"[page#{self._page_seq}] readiness phase={name} start "
+                f"timeout_ms={phase_timeout_ms} app_ids={app_ids}",
+            )
+            try:
+                with sw.phase(name):
+                    result = await asyncio.wait_for(
+                        operation(phase_timeout_ms),
+                        timeout=phase_timeout_ms / 1000,
+                    )
+            except (TimeoutError, asyncio.TimeoutError, PlaywrightTimeoutError) as e:
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                raise TimeoutError(
+                    f"{p} _wait_ready phase={name} timeout after {elapsed_ms}ms "
+                    f"(budget={timeout_ms}ms, app_ids={app_ids}): {type(e).__name__}: {e}"
+                ) from e
+            except Exception as e:
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                raise RuntimeError(
+                    f"{p} _wait_ready phase={name} failed after {elapsed_ms}ms "
+                    f"(app_ids={app_ids}): {type(e).__name__}: {e}"
+                ) from e
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            _log_env_info(
+                self,
+                f"[page#{self._page_seq}] readiness phase={name} done elapsed_ms={elapsed_ms}",
+            )
+            return result
+
+        await run_phase(
+            "__SIM__",
+            lambda phase_timeout_ms: self.page.wait_for_function(
+                "() => Boolean(window.__SIM__ && typeof window.__SIM__.getState === 'function')",
+                timeout=phase_timeout_ms,
+            ),
         )
+        await run_phase(
+            "__SIM_FS__",
+            lambda phase_timeout_ms: self.page.wait_for_function(
+                "() => Boolean(window.__SIM_FS__)",
+                timeout=phase_timeout_ms,
+            ),
+        )
+        await run_phase(
+            "__OS__",
+            lambda phase_timeout_ms: self.page.wait_for_function(
+                "() => Boolean(window.__OS__?.openApp)",
+                timeout=phase_timeout_ms,
+            ),
+        )
+
+        async def wait_for_data(_phase_timeout_ms: int):
+            return await self.page.evaluate(
+                """async (ids) => {
+                    if (!window.__SIM__?.waitForData) return {ok: true, failed: []};
+                    // Monkey-patch fetch to capture response debug info on non-ok responses
+                    const origFetch = window.fetch;
+                    window.fetch = async function(...args) {
+                        const resp = await origFetch.apply(this, args);
+                        if (!resp.ok) {
+                            const body = await resp.clone().text().catch(() => '(unreadable)');
+                            console.error(
+                                `[waitForData] fetch FAILED: url=${resp.url} status=${resp.status} ` +
+                                `statusText=${resp.statusText} type=${resp.type} redirected=${resp.redirected} ` +
+                                `bodyLen=${body.length} body=${body.substring(0, 200)}`
+                            );
+                        }
+                        return resp;
+                    };
+                    try {
+                        await window.__SIM__.waitForData(ids === null ? undefined : ids);
+                        return {ok: true, failed: []};
+                    } catch (e) {
+                        return {ok: false, error: String(e)};
+                    } finally {
+                        window.fetch = origFetch;
+                    }
+                }""",
+                app_ids,
+            )
+
+        wait_result = await run_phase("waitForData", wait_for_data)
         if not wait_result.get("ok"):
             raise RuntimeError(f"{p} _wait_ready phase=waitForData({app_ids}) failed: {wait_result.get('error', 'unknown')}")
 
