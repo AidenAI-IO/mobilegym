@@ -98,6 +98,28 @@ async def test_mobile_gym_wait_ready_uses_one_total_deadline() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mobile_gym_wait_ready_preserves_stopwatch_phase_names() -> None:
+    env = MobileGymEnv(url="http://localhost", verbose=False)
+
+    class FakePage:
+        async def wait_for_function(self, _expression, *, timeout):
+            return None
+
+        async def evaluate(self, _expression, _app_ids):
+            return {"ok": True, "failed": []}
+
+    env._page = FakePage()  # type: ignore[assignment]
+
+    await env._wait_ready(timeout_ms=100, app_ids=[])
+
+    phases = env.stopwatch.to_flat()
+    assert {"SIM", "SIM_FS", "OS", "waitForData"} <= phases.keys()
+    assert "__SIM__" not in phases
+    assert "__SIM_FS__" not in phases
+    assert "__OS__" not in phases
+
+
+@pytest.mark.asyncio
 async def test_mobile_gym_wait_ready_times_out_wait_for_data_with_phase() -> None:
     env = MobileGymEnv(url="http://localhost", verbose=False)
 

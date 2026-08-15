@@ -1334,7 +1334,7 @@ class MobileGymEnv(BaseMobileEnv):
         p = f"{self._log_prefix}[page#{self._page_seq}]"
         deadline = time.monotonic() + max(1, timeout_ms) / 1000
 
-        async def run_phase(name: str, operation):
+        async def run_phase(name: str, operation, *, stopwatch_name: str | None = None):
             phase_timeout_ms = _remaining_timeout_ms(deadline)
             started = time.monotonic()
             _log_env_info(
@@ -1343,7 +1343,7 @@ class MobileGymEnv(BaseMobileEnv):
                 f"timeout_ms={phase_timeout_ms} app_ids={app_ids}",
             )
             try:
-                with sw.phase(name):
+                with sw.phase(stopwatch_name or name):
                     result = await asyncio.wait_for(
                         operation(phase_timeout_ms),
                         timeout=phase_timeout_ms / 1000,
@@ -1373,6 +1373,7 @@ class MobileGymEnv(BaseMobileEnv):
                 "() => Boolean(window.__SIM__ && typeof window.__SIM__.getState === 'function')",
                 timeout=phase_timeout_ms,
             ),
+            stopwatch_name="SIM",
         )
         await run_phase(
             "__SIM_FS__",
@@ -1380,6 +1381,7 @@ class MobileGymEnv(BaseMobileEnv):
                 "() => Boolean(window.__SIM_FS__)",
                 timeout=phase_timeout_ms,
             ),
+            stopwatch_name="SIM_FS",
         )
         await run_phase(
             "__OS__",
@@ -1387,6 +1389,7 @@ class MobileGymEnv(BaseMobileEnv):
                 "() => Boolean(window.__OS__?.openApp)",
                 timeout=phase_timeout_ms,
             ),
+            stopwatch_name="OS",
         )
 
         async def wait_for_data(_phase_timeout_ms: int):
