@@ -25,7 +25,7 @@ export function ScrollLabDetailPage() {
       <header className="h-14 px-3 flex items-center gap-2 bg-app-surface border-b border-app-border flex-shrink-0">
         <button
           type="button"
-          aria-label="Back"
+          aria-label={s.back}
           className="w-10 h-10 rounded-full flex items-center justify-center active:bg-gray-100"
           {...bindBack<HTMLButtonElement>()}
         >

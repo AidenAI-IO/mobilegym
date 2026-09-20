@@ -2,6 +2,7 @@ import type { StringKey } from './strings';
 
 export const stringsEn: Partial<Record<StringKey, string>> = {
   app_name: 'Scroll Lab',
+  back: 'Back',
   list_subtitle: '100 fixed items · no search shortcut',
   detail_position_prefix: 'List position',
   detail_position_separator: 'of',

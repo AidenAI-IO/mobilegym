@@ -1,5 +1,6 @@
 export const strings = {
   app_name: '列表实验室',
+  back: '返回',
   list_subtitle: '固定 100 项 · 无搜索入口',
   detail_position_prefix: '列表位置',
   detail_position_separator: '/',

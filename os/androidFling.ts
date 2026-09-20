@@ -74,7 +74,7 @@ export function androidFlingDistance(
   friction: number = DEFAULT_SCROLL_FRICTION,
 ): number {
   if (!Number.isFinite(velocity) || Math.abs(velocity) < 1) return 0;
-  if (!Number.isFinite(ppi) || ppi <= 0 || friction <= 0) return 0;
+  if (!Number.isFinite(ppi) || ppi <= 0 || !Number.isFinite(friction) || friction <= 0) return 0;
   const l = splineDeceleration(velocity, ppi, friction);
   return friction * physicalCoeff(ppi) * Math.exp((DECELERATION_RATE / (DECELERATION_RATE - 1)) * l);
 }
@@ -86,7 +86,7 @@ export function androidFlingDurationMs(
   friction: number = DEFAULT_SCROLL_FRICTION,
 ): number {
   if (!Number.isFinite(velocity) || Math.abs(velocity) < 1) return 0;
-  if (!Number.isFinite(ppi) || ppi <= 0 || friction <= 0) return 0;
+  if (!Number.isFinite(ppi) || ppi <= 0 || !Number.isFinite(friction) || friction <= 0) return 0;
   const l = splineDeceleration(velocity, ppi, friction);
   return 1000 * Math.exp(l / (DECELERATION_RATE - 1));
 }
@@ -95,6 +95,10 @@ export function androidFlingDurationMs(
 export function androidFlingProgress(progress: number): number {
   if (progress <= 0) return 0;
   if (progress >= 1) return 1;
-  const index = Math.min(NB_SAMPLES, Math.floor(NB_SAMPLES * progress));
-  return SPLINE_POSITION[index];
+  const scaled = NB_SAMPLES * progress;
+  const index = Math.min(NB_SAMPLES - 1, Math.floor(scaled));
+  const fraction = scaled - index;
+  const start = SPLINE_POSITION[index];
+  const end = SPLINE_POSITION[index + 1];
+  return start + (end - start) * fraction;
 }

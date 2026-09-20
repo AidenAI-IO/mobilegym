@@ -49,6 +49,30 @@ describe('Android fling physics', () => {
     expect(androidFlingDurationMs(0, PPI)).toBe(0);
   });
 
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -0.015])(
+    'returns no coast with unusable friction %s',
+    (friction) => {
+      expect(androidFlingDistance(4000, PPI, friction)).toBe(0);
+      expect(androidFlingDurationMs(4000, PPI, friction)).toBe(0);
+    },
+  );
+
+  it('advances within each sampled interval without jumping at its boundary', () => {
+    expect(androidFlingProgress(0.205)).toBeGreaterThan(androidFlingProgress(0.201));
+    expect(androidFlingProgress(0.209)).toBeGreaterThan(androidFlingProgress(0.205));
+    expect(androidFlingProgress(0.21) - androidFlingProgress(0.21 - 1e-8)).toBeLessThan(1e-6);
+  });
+
+  it('approaches the final position continuously and clamps at completion', () => {
+    const nearEnd = androidFlingProgress(1 - 1e-8);
+    expect(Number.isFinite(nearEnd)).toBe(true);
+    expect(nearEnd).toBeLessThanOrEqual(1);
+    expect(1 - nearEnd).toBeLessThan(1e-8);
+    expect(androidFlingProgress(1)).toBe(1);
+    expect(androidFlingProgress(1.1)).toBe(1);
+    expect(androidFlingProgress(-0.1)).toBe(0);
+  });
+
   it('walks the spline position curve from 0 to 1, decelerating', () => {
     expect(androidFlingProgress(0)).toBe(0);
     expect(androidFlingProgress(1)).toBe(1);
