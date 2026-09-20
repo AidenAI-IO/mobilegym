@@ -10,6 +10,7 @@
  * - physical 像素（例如 1080x2400）需要显式声明（避免在不同环境下用 devicePixelRatio 误判）
  */
 import { SIMULATOR_CONFIG } from './data';
+import { swipeProgress, releaseProgressVelocity, type MotionSample, type SwipeProfile } from './swipeMotion';
 import { getScrollMeta, ScrollMetaMap } from './scrollMeta';
 import { androidFlingDistance, androidFlingDurationMs, androidFlingProgress, ppiForDpr } from './androidFling';
 
@@ -22,6 +23,7 @@ export type SimCoordSpace = 'css' | 'physical';
 export type SimCoordOptions = { coords?: SimCoordSpace; dpr?: number };
 
 export interface SimInputAPI {
+  swipeProfiles: readonly SwipeProfile[];
   tap: (x: number, y: number, opts?: SimCoordOptions) => void;
   doubleTap: (x: number, y: number, opts?: SimCoordOptions) => void;
   longPress: (x: number, y: number, ms?: number, opts?: SimCoordOptions) => Promise<void>;
@@ -43,6 +45,8 @@ export interface SimInputAPI {
       ms?: number;
       /** 手指滑动采样步数 */
       steps?: number;
+      /** Movement profile; omitted preserves linear motion. */
+      profile?: SwipeProfile;
       /** 是否开启松手惯性（默认 true） */
       inertia?: boolean;
       /** 惯性时长上限（ms）；省略时使用 Android fling 模型算出的时长 */
@@ -461,6 +465,7 @@ export function initSimInput(): void {
   let swipeQueue: Promise<void> = Promise.resolve();
 
   const api: SimInputAPI = {
+    swipeProfiles: ['linear', 'decelerate'],
     tap: (x, y, coordOpts) => {
       assertFinite(x, 'tap.x');
       assertFinite(y, 'tap.y');
@@ -633,12 +638,18 @@ export function initSimInput(): void {
       // 先验证参数（在队列外，这样错误能立即抛出且不影响队列）
       const sp = coercePoint(start, 'swipe.start');
       const ep = coercePoint(end, 'swipe.end');
+      const profile = opts?.profile ?? 'linear';
+      if (profile !== 'linear' && profile !== 'decelerate') throw new TypeError('profile must be linear or decelerate');
+      const ms = Math.max(0, opts?.ms ?? (profile === 'decelerate' ? 600 : 300));
+      if (!Number.isFinite(ms) || ms > 10000) throw new TypeError('swipe ms must be finite and <= 10000');
+      const requestedSteps = opts?.steps ?? (profile === 'decelerate' ? 24 : 10);
+      if (!Number.isInteger(requestedSteps) || requestedSteps < 1 || requestedSteps > 1000) throw new TypeError('swipe steps must be in [1,1000]');
+      const steps = Math.max(2, requestedSteps, profile === 'decelerate' ? Math.ceil(ms / 16) : 0);
 
       swipeQueue = swipeQueue
+        .catch(() => {}) // A rejected gesture must not poison the next one.
         .then(async () => {
           // 滑动时长和步数
-          const ms = Math.max(0, opts?.ms ?? 300);
-          const steps = Math.max(2, opts?.steps ?? 10);
           const inertia = opts?.inertia ?? true;
           const inertiaCapMs = opts?.inertiaMs;
 
@@ -689,29 +700,32 @@ export function initSimInput(): void {
           dispatchTouch(el, 'touchstart', s.x, s.y);
           dispatchPointer(el, 'pointerdown', s.x, s.y, { buttons: 1 });
 
-          // 分步发送 touchmove 并同步滚动
-          const dt = ms / steps;
+          // Sample deadlines, then lift immediately at the final position.
+          // Late frames skip stale samples instead of rushing through them.
+          const started = performance.now();
+          const samples: MotionSample[] = [{ timeMs: 0, progress: 0 }];
+          const initialScrollX = scrollTarget?.scrollLeft ?? 0;
+          const initialScrollY = scrollTarget?.scrollTop ?? 0;
           for (let i = 1; i <= steps; i++) {
-            const progress = i / steps;
+            const remaining = started + ms * i / steps - performance.now();
+            if (remaining > 0) await sleep(remaining);
+            const elapsed = performance.now() - started;
+            const t = ms > 0 ? Math.min(1, Math.max(i / steps, elapsed / ms)) : i / steps;
+            const progress = swipeProgress(t, profile);
             const xi = s.x + dx * progress;
             const yi = s.y + dy * progress;
-
-            // 发送 touch/pointer move 事件
             dispatchTouch(el, 'touchmove', xi, yi);
             dispatchPointer(el, 'pointermove', xi, yi, { buttons: 1 });
-            
-            // 同步滚动（如果有滚动容器）
             if (scrollTarget) {
-              // 计算这一步应该滚动多少（滑动距离的反方向）
-              const stepScrollX = -dx / steps;
-              const stepScrollY = -dy / steps;
-              scrollTarget.scrollBy({ left: stepScrollX, top: stepScrollY, behavior: 'auto' });
+              // Absolute targets preserve subpixel deltas in the slow tail.
+              scrollTarget.scrollTo({ left: initialScrollX - dx * progress, top: initialScrollY - dy * progress, behavior: 'auto' });
             }
-
-
-            await sleep(dt);
+            samples.push({ timeMs: elapsed, progress });
+            if (t >= 1) break;
+            i = Math.max(i, Math.floor(t * steps));
           }
 
+          samples.push({ timeMs: performance.now() - started, progress: 1 });
           dispatchTouch(el, 'touchend', e.x, e.y);
           dispatchPointer(el, 'pointerup', e.x, e.y, { buttons: 0 });
 
@@ -725,7 +739,7 @@ export function initSimInput(): void {
             let flingMs = 0;
             let flingCss = 0;
             if (travel > 0 && ms > 0) {
-              const velocityCss = travel / (ms / 1000);
+              const velocityCss = travel * releaseProgressVelocity(samples);
               const ppi = ppiForDpr(dpr);
               flingCss = androidFlingDistance(velocityCss * dpr, ppi) / dpr;
               flingMs = androidFlingDurationMs(velocityCss * dpr, ppi);
@@ -758,8 +772,9 @@ export function initSimInput(): void {
           }
         })
         .catch(err => {
-          // 捕获错误，打印日志但不向后传播，让队列能继续工作
+          // Report failures to the caller; the next queued gesture recovers.
           console.error('[__SIM_INPUT__] swipe error:', err);
+          throw err;
         });
       return swipeQueue;
     },

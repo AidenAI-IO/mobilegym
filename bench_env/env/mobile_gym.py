@@ -123,10 +123,12 @@ class SwipeHandler(ActionHandler):
     async def execute(self, action: Action) -> Optional[StepResult]:
         x1, y1 = self.env._parse_point(action.data.get("point1"))
         x2, y2 = self.env._parse_point(action.data.get("point2"))
-        duration = int(action.data.get("duration", 400))
+        profile = action.data.get("profile", "linear")
+        duration = int(action.data.get("duration", 600 if profile == "decelerate" else 400))
         if self.env.verbose:
             _log_env_info(self.env, f"SWIPE: ({x1:.0f}, {y1:.0f}) -> ({x2:.0f}, {y2:.0f}), duration={duration}ms")
-        await self.env._swipe((x1, y1), (x2, y2), duration=duration)
+        await self.env._swipe((x1, y1), (x2, y2), duration=duration,
+                              profile=profile, steps=action.data.get("steps"))
         return None
 
 
@@ -1139,20 +1141,32 @@ class MobileGymEnv(BaseMobileEnv):
                 await self.page.keyboard.press("Backspace")
             await self.page.keyboard.type(text, delay=0)
 
-    async def _swipe(self, start: Tuple[float, float], end: Tuple[float, float], duration: int = 400) -> None:
+    async def _swipe(self, start: Tuple[float, float], end: Tuple[float, float], duration: int = 400, *, profile: str = "linear", steps: Optional[int] = None) -> None:
+        if profile not in ("linear", "decelerate"):
+            raise ValueError("profile must be linear or decelerate")
         x1, y1 = start
         x2, y2 = end
         try:
             used = await self.page.evaluate(
-                """async ({sx,sy,ex,ey,d}) => {
-                    if (window.__SIM_INPUT__?.swipe) { await window.__SIM_INPUT__.swipe({x:sx,y:sy},{x:ex,y:ey},{ms:d}); return true; }
+                """async ({sx,sy,ex,ey,d,profile,steps}) => {
+                    if (profile === 'decelerate' && !window.__SIM_INPUT__?.swipeProfiles?.includes(profile)) {
+                        throw new Error('simulator does not support profile decelerate; update MobileGym');
+                    }
+                    if (window.__SIM_INPUT__?.swipe) {
+                        await window.__SIM_INPUT__.swipe({x:sx,y:sy},{x:ex,y:ey},{ms:d,profile,...(steps == null ? {} : {steps})});
+                        return true;
+                    }
                     return false;
                 }""",
-                {"sx": x1/self.dpr, "sy": y1/self.dpr, "ex": x2/self.dpr, "ey": y2/self.dpr, "d": duration},
+                {"sx": x1/self.dpr, "sy": y1/self.dpr, "ex": x2/self.dpr, "ey": y2/self.dpr, "d": duration, "profile": profile, "steps": steps},
             )
             if used:
                 return
+            if profile == "decelerate":
+                raise RuntimeError("simulator swipe is unavailable")
         except Exception as e:
+            if profile == "decelerate":
+                raise RuntimeError("decelerating swipe failed; refusing a linear fallback") from e
             logger.debug(f"__SIM_INPUT__.swipe failed, falling back to mouse: {type(e).__name__}")
         cx1, cy1 = self._p2c(x1, y1)
         cx2, cy2 = self._p2c(x2, y2)
